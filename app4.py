@@ -38,8 +38,9 @@ def init_db():
     # Tables
     c.execute('''CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password_hash TEXT)''')
     
+    # UPDATE: Menambahkan kolom no_hp
     c.execute('''CREATE TABLE IF NOT EXISTS bookings (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, customer_name TEXT, date TEXT, 
+        id INTEGER PRIMARY KEY AUTOINCREMENT, customer_name TEXT, no_hp TEXT, date TEXT, 
         start_hour INTEGER, duration INTEGER, instruments TEXT, price REAL, status TEXT)''')
     
     c.execute('''CREATE TABLE IF NOT EXISTS inventory (id INTEGER PRIMARY KEY AUTOINCREMENT, item_name TEXT UNIQUE)''')
@@ -66,13 +67,8 @@ def init_db():
     return conn
 
 def log_action(conn, action, details):
-    # 1. Tentukan Zona Waktu WIB (UTC+7)
     wib = datetime.timezone(datetime.timedelta(hours=7))
-    
-    # 2. Ambil waktu sekarang dalam WIB, format jadi string
     now_wib = datetime.datetime.now(wib).strftime("%Y-%m-%d %H:%M:%S")
-    
-    # 3. Masukkan ke database secara manual (timpa default timestamp)
     conn.execute("INSERT INTO audit_logs (action, details, timestamp) VALUES (?, ?, ?)", 
                  (action, details, now_wib))
     conn.commit()
@@ -99,6 +95,29 @@ def check_conflict(conn, date_str, start, duration, exclude_id=None):
         if (start < b_start + b_dur) and (start + duration > b_start): return True
     return False
 
+# --- LOGIC LEVEL CUSTOMER BARU ---
+def get_customer_stats(conn, no_hp):
+    """Menghitung total jam terbang berdasarkan Nomor HP"""
+    c = conn.cursor()
+    # Pastikan no_hp ada di database sebelum query
+    try:
+        c.execute("SELECT SUM(duration) FROM bookings WHERE no_hp = ?", (no_hp,))
+        result = c.fetchone()[0]
+        return result if result else 0
+    except:
+        return 0
+
+def get_level_info(total_jam):
+    """Menentukan Level dan Diskon berdasarkan Total Jam"""
+    if total_jam >= 50:
+        return "🎸 Rockstar", "Diskon 15% booking selanjutnya!", 1.0, "gold"
+    elif total_jam >= 20:
+        return "🎹 Pro Musician", "Diskon 10% booking selanjutnya!", 0.7, "orange"
+    elif total_jam >= 5:
+        return "🥁 Garage Band", "Diskon 5% (Member setia)", 0.4, "blue"
+    else:
+        return "🎤 Newcomer", "Main 5 jam lagi untuk dapat diskon!", 0.1, "gray"
+
 def parse_intent(user_input, inventory_list):
     txt = user_input.lower()
     res = {'intent': 'unknown', 'date': None, 'time': None, 'dur': None, 'found_items': []}
@@ -109,11 +128,8 @@ def parse_intent(user_input, inventory_list):
     elif any(x in txt for x in ['booking', 'sewa', 'pesan']): res['intent'] = 'booking'
     
     clean_txt = txt 
-    
-    # === TIMEZONE (WIB / UTC+7) ===
     wib = datetime.timezone(datetime.timedelta(hours=7))
     today = datetime.datetime.now(wib).date()
-    # ========================================
 
     if 'hari ini' in txt: 
         res['date'] = today.strftime("%Y-%m-%d")
@@ -125,7 +141,6 @@ def parse_intent(user_input, inventory_list):
         date_match = re.search(r'(tanggal|tgl)\s*(\d{1,2})', clean_txt)
         if date_match:
             try: 
-                # Pastikan tanggal yang diinput user digabungkan dengan tahun/bulan saat ini (WIB)
                 target_day = int(date_match.group(2))
                 res['date'] = today.replace(day=target_day).strftime("%Y-%m-%d")
                 clean_txt = clean_txt.replace(date_match.group(0), "")
@@ -171,38 +186,72 @@ def finalize_booking(conn, bs):
         price, is_peak = calculate_price(bs['time'], bs['dur'])
         items_str = ", ".join(set(bs['items'])).title() if bs['items'] else "Standard Room"
         
-        conn.execute('''INSERT INTO bookings (customer_name, date, start_hour, duration, instruments, price, status) 
-                        VALUES (?,?,?,?,?,?,?)''', 
-                        (bs['name'], bs['date'], bs['time'], bs['dur'], items_str, price, "Confirmed"))
+        # Simpan No HP juga
+        conn.execute('''INSERT INTO bookings (customer_name, no_hp, date, start_hour, duration, instruments, price, status) 
+                        VALUES (?,?,?,?,?,?,?,?)''', 
+                        (bs['name'], bs['phone'], bs['date'], bs['time'], bs['dur'], items_str, price, "Confirmed"))
         
-        log_action(conn, "NEW_BOOKING", f"{bs['name']} - {bs['date']}")
+        log_action(conn, "NEW_BOOKING", f"{bs['name']} ({bs['phone']}) - {bs['date']}")
         conn.commit()
         
-        # --- FITUR UNIK 3: KWITANSI DIGITAL HTML ---
         ticket_html = f"""
-        <div style="
-            background-color: #fff; 
-            color: #000; 
-            padding: 20px; 
-            border-radius: 10px; 
-            border: 2px dashed #333; 
-            font-family: monospace; 
-            margin-top: 10px;">
-            <h3 style="text-align: center; margin: 0;">🎹 SMART STUDIO 🎹</h3>
-            <p style="text-align: center; font-size: 12px;">Bukti Reservasi Digital</p>
-            <hr style="border-top: 1px dashed #000;">
-            <p><strong>Nama:</strong> {bs['name']}<br>
-            <strong>Tanggal:</strong> {bs['date']}<br>
-            <strong>Jam:</strong> {bs['time']}:00 WIB<br>
-            <strong>Durasi:</strong> {bs['dur']} Jam<br>
-            <strong>Alat:</strong> {items_str}</p>
-            <hr style="border-top: 1px dashed #000;">
-            <h2 style="text-align: right; margin: 0;">Rp {price:,.0f}</h2>
-            <p style="text-align: center; margin-top: 15px; font-size: 10px;">
-                *Tunjukkan tiket ini ke admin saat datang*
-            </p>
-        </div>
-        """
+<div style="
+    font-family: 'Courier New', Courier, monospace;
+    background-color: #fffcf5; 
+    color: #333;
+    padding: 25px;
+    max-width: 400px;
+    margin: 10px auto;
+    border: 2px solid #333;
+    border-radius: 10px;
+    box-shadow: 8px 8px 0px rgba(0,0,0,0.2);
+    position: relative;
+ ">
+<div style="text-align: center; border-bottom: 2px dashed #333; padding-bottom: 15px; margin-bottom: 15px;">
+<p style="margin: 0; font-weight: 900; letter-spacing: 2px; color: #000000 !important;">🎹 SMART STUDIO</h2>
+<p style="margin: 5px 0 0; font-size: 12px; color: #000000;">DIGITAL RECEIPT TICKET</p>
+<p style="margin: 0; font-size: 10px; color: #777;">ID: #{int(time.time())}</p>
+</div>
+
+<div style="font-size: 14px; line-height: 1.6;">
+<div style="display: flex; justify-content: space-between;">
+<span>👤 Nama:</span>
+<strong>{bs['name']}</strong>
+</div>
+<div style="display: flex; justify-content: space-between;">
+<span>📱 No HP:</span>
+<strong>{bs['phone']}</strong>
+</div>
+<div style="display: flex; justify-content: space-between;">
+<span>📅 Tgl:</span>
+<strong>{bs['date']}</strong>
+</div>
+<div style="display: flex; justify-content: space-between;">
+<span>⏰ Jam:</span>
+<strong>{bs['time']}:00 WIB</strong>
+</div>
+<div style="display: flex; justify-content: space-between;">
+<span>⏳ Durasi:</span>
+<strong>{bs['dur']} Jam</strong>
+</div>
+<hr style="border: none; border-top: 1px dashed #bbb; margin: 10px 0;">
+<div style="margin-bottom: 5px;">
+<span>🎸 Alat:</span><br>
+<span style="display: inline-block; background: #eee; padding: 2px 6px; border-radius: 4px; font-size: 12px;">{items_str}</span>
+</div>
+</div>
+
+<div style="margin-top: 20px; border-top: 2px solid #333; padding-top: 10px; text-align: right;">
+<p style="margin: 0; font-size: 12px;">Total Paid</p>
+<p style="margin: 0; font-size: 28px; color: #000000;">Rp {price:,.0f}</h1>
+</div>
+
+<div style="margin-top: 15px; text-align: center; opacity: 0.7;">
+<div style="height: 30px; background: repeating-linear-gradient(90deg, #333, #333 2px, transparent 2px, transparent 4px);"></div>
+<p style="font-size: 10px; margin-top: 5px;">*Tunjukkan tiket ini ke Admin*</p>
+</div>
+</div>
+"""
         
         msg = ticket_html
         return msg, True
@@ -234,38 +283,28 @@ def main():
     st.sidebar.title("🎹 SmartStudio Bot")
     st.sidebar.caption("By Hanateam")
     
-    # --- FITUR UNIK 2: GAMIFIKASI MEMBER (RPG STYLE) ---
+    # --- UPDATED: CEK STATUS MEMBER (PERSONAL) ---
     st.sidebar.markdown("---")
-    st.sidebar.markdown("### 🏆 Status Member")
+    st.sidebar.header("🏆 Status Member Kamu")
+    st.sidebar.write("Masukkan No HP untuk cek level & diskon!")
     
-    # Simulasi Logic: Ambil total durasi booking dari database
-    c_level = conn.cursor()
-    c_level.execute("SELECT SUM(duration) FROM bookings")
-    row_lvl = c_level.fetchone()
-    total_jam_studio = row_lvl[0] if row_lvl[0] is not None else 0
+    cek_hp = st.sidebar.text_input("No. WhatsApp:", placeholder="0812xxx")
     
-    # Tentukan Level Studio
-    lvl_name = "Garage Band"
-    lvl_color = "gray"
-    progress = 0.1
-    
-    if total_jam_studio > 50:
-        lvl_name = "Indie Artist"
-        lvl_color = "blue"
-        progress = 0.4
-    if total_jam_studio > 100:
-        lvl_name = "Rockstar"
-        lvl_color = "orange"
-        progress = 0.7
-    if total_jam_studio > 500:
-        lvl_name = "Legend"
-        lvl_color = "gold"
-        progress = 1.0
+    if cek_hp:
+        # Hitung statistik customer ini
+        jam_terbang = get_customer_stats(conn, cek_hp)
+        level_name, benefit, progress, lvl_color = get_level_info(jam_terbang)
         
-    st.sidebar.metric("Total Jam Terbang Studio", f"{total_jam_studio} Jam")
-    st.sidebar.write(f"Level Studio: **:{lvl_color}[{lvl_name}]**")
-    st.sidebar.progress(progress)
-    st.sidebar.caption("Bantu naikkan level studio dengan sering latihan!")
+        # Tampilkan Card UI
+        st.sidebar.info(f"**Level: {level_name}**")
+        st.sidebar.metric("Jam Terbang", f"{jam_terbang} Jam")
+        st.sidebar.progress(progress)
+        st.sidebar.success(f"🎁 {benefit}")
+    else:
+        st.sidebar.caption("Data level bersifat personal. Masukkan nomor HP untuk melihat progress Anda.")
+    
+    # --- UPDATED: ADMIN AREA (TERTUTUP) ---
+    st.sidebar.markdown("---")
     
     if "admin_logged_in" not in st.session_state: st.session_state.admin_logged_in = False
     
@@ -274,12 +313,13 @@ def main():
     if "bot_state" not in st.session_state: 
         st.session_state.bot_state = {
             "mode": "idle", "step": 0, 
-            "name": None, "date": None, "time": None, "dur": None, 
+            "name": None, "phone": None, # Added phone to state
+            "date": None, "time": None, "dur": None, 
             "items": [], "target_id": None
         }
 
-    # Admin Auth
-    with st.sidebar.expander("🔐 Admin Area", expanded=False):
+    # Admin Auth (Expanded=False agar tertutup)
+    with st.sidebar.expander("🔐 Admin Area (Klik untuk buka)", expanded=False):
         if not st.session_state.admin_logged_in:
             pwd = st.text_input("Password Admin", type="password")
             if st.button("Login"):
@@ -415,41 +455,26 @@ def main():
                         except: st.error("Item sudah ada!")
 
         with t3: # Courses
-            # 1. Tampilkan Tabel Data
             st.dataframe(df_crs, use_container_width=True)
             
-            # --- FITUR HAPUS SISWA (BARU) ---
             if not df_crs.empty:
                 st.markdown("### 🗑️ Hapus Data Siswa")
                 c_del_s1, c_del_s2 = st.columns([3, 1])
-                
                 with c_del_s1:
-                    # Membuat daftar pilihan: ID - Nama (Alat)
                     del_course_options = df_crs.apply(lambda x: f"{x['id']} - {x['student_name']} ({x['instrument']})", axis=1)
                     selected_course_del = st.selectbox("Pilih Siswa untuk Dihapus", del_course_options)
-                
                 with c_del_s2:
-                    st.write("") # Spasi agar tombol sejajar
+                    st.write("") 
                     st.write("")
-                    # Tombol Hapus dengan warna merah
                     if st.button("❌ Hapus Siswa"):
-                        # Ambil ID dari string pilihan (angka sebelum tanda strip)
                         id_to_del = int(selected_course_del.split(' - ')[0])
-                        
-                        # Hapus dari Database
                         conn.execute("DELETE FROM courses WHERE id=?", (id_to_del,))
-                        
-                        # Catat di Log
                         log_action(conn, "DELETE_COURSE", f"Student ID {id_to_del} removed by Admin")
                         conn.commit()
-                        
                         st.success(f"Data siswa ID {id_to_del} berhasil dihapus.")
-                        time.sleep(1)
-                        st.rerun()
+                        time.sleep(1); st.rerun()
             
             st.markdown("---")
-
-            # 2. Form Tambah Siswa (Existing)
             st.markdown("#### ➕ Tambah Siswa Baru")
             with st.form("new_student"):
                 c_s1, c_s2 = st.columns(2)
@@ -462,7 +487,7 @@ def main():
                     dur = st.number_input("Durasi (Jam)", min_value=1, value=1)
                 
                 if st.form_submit_button("Daftar Siswa"):
-                    if n: # Pastikan nama tidak kosong
+                    if n: 
                         conn.execute("""INSERT INTO courses 
                             (student_name, instrument, schedule_day, schedule_time, duration, status) 
                             VALUES (?,?,?,?,?,?)""", 
@@ -470,8 +495,7 @@ def main():
                         conn.commit()
                         log_action(conn, "NEW_COURSE", f"Added student: {n}")
                         st.success("Siswa berhasil ditambahkan!")
-                        time.sleep(1)
-                        st.rerun()
+                        time.sleep(1); st.rerun()
                     else:
                         st.warning("Nama siswa wajib diisi.")
 
@@ -484,34 +508,48 @@ def main():
     else:
         st.title("🤖 Assistant Studio")
         
-        # --- FITUR UNIK 1: VISUALISASI KEPADATAN (HEATMAP) ---
-        with st.expander("📊 Cek Jam Rame & Sepi (Smart Insight)", expanded=False):
-            st.write("Gunakan grafik ini untuk mencari jam sepi agar latihan lebih tenang!")
+        # --- FITUR UPDATE: CEK JAM RAME & SEPI (DENGAN TANGGAL) ---
+        with st.expander("📊 Cek Ketersediaan & Jam Rame (Klik di sini)", expanded=False):
+            # 1. Input Pilih Tanggal
+            col_date, col_ket = st.columns([1, 2])
+            with col_date:
+                tgl_pilih = st.date_input("Pilih Tanggal:", datetime.date.today())
             
-            # Ambil data statistik jam dari database
+            with col_ket:
+                st.write("") # Spasi
+                st.caption(f"Menampilkan kepadatan studio untuk tanggal: **{tgl_pilih.strftime('%d %B %Y')}**")
+
+            # 2. Logic Query Data Spesifik Tanggal
             c_stat = conn.cursor()
-            c_stat.execute("SELECT start_hour, COUNT(*) FROM bookings GROUP BY start_hour")
-            data_stat = c_stat.fetchall()
+            c_stat.execute("SELECT start_hour, duration FROM bookings WHERE date = ?", (str(tgl_pilih),))
+            bookings_today = c_stat.fetchall()
             
-            # Siapkan data 0 untuk semua jam (8 pagi - 11 malam) agar grafik tidak bolong
-            hours_map = {h: 0 for h in range(8, 24)}
-            for h, count in data_stat:
-                hours_map[h] = count
+            # 3. Mapping Jam 8-23
+            hours_map = {h: 0 for h in range(8, 24)} # Default 0 (Kosong)
             
-            # Buat DataFrame untuk Streamlit
+            # Isi slot yang terbooking
+            for start, dur in bookings_today:
+                for h in range(start, start + dur):
+                    if h in hours_map:
+                        hours_map[h] += 1  # Tambah 1 jika ada booking
+            
+            # 4. Visualisasi
             df_heat = pd.DataFrame({
                 "Jam": [f"{h}:00" for h in hours_map.keys()],
-                "Kepadatan": list(hours_map.values())
+                "Status": ["⛔ Penuh" if v > 0 else "✅ Kosong" for v in hours_map.values()],
+                "Value": list(hours_map.values())
             })
-
-            # Tampilkan Bar Chart dengan warna custom
-            st.bar_chart(df_heat.set_index("Jam"), color="#F63366") 
             
-            # Logika teks pintar
-            busy_hour = max(hours_map, key=hours_map.get)
-            st.caption(f"💡 **Info:** Jam paling rebutan biasanya pukul **{busy_hour}:00**. Coba booking pagi atau siang untuk harga promo (jika ada).")
+            # Tampilkan Grafik
+            st.bar_chart(df_heat.set_index("Jam")['Value'], color="#F63366")
+            
+            # Info Teks
+            jam_penuh = [k for k, v in hours_map.items() if v > 0]
+            if jam_penuh:
+                st.warning(f"Jam yang sudah terisi: {', '.join([str(x)+':00' for x in jam_penuh])}")
+            else:
+                st.success("Asik! Jadwal hari ini masih kosong melompong. Bebas pilih jam!")
 
-        # --- USER GUIDE ---
         with st.expander("ℹ️  Panduan / Cara Pakai (Klik untuk baca)", expanded=True):
             st.markdown("""
             **1. Mau Booking?**
@@ -519,9 +557,6 @@ def main():
             
             **2. Mau Ganti Jadwal?**
             👉 Ketik: *"Reschedule"* lalu ikuti petunjuk bot.
-            
-            **3. Mau Batal?**
-            👉 Ketik *"Batal"* untuk info kontak admin.
             """)
         
         if not st.session_state.chat_history:
@@ -531,16 +566,13 @@ def main():
         inv_rows = conn.execute("SELECT item_name FROM inventory").fetchall()
         inv_list = [x[0] for x in inv_rows]
         
-        # Display Chat with HTML Support for Receipt
         for role, txt in st.session_state.chat_history:
             with st.chat_message(role): 
-                # Jika ada tag HTML div (tanda kwitansi), render HTML
                 if "<div" in txt:
                     st.markdown(txt, unsafe_allow_html=True)
                 else:
                     st.markdown(txt)
             
-        # User Input
         if prompt := st.chat_input("Ketik 'Booking' atau 'Reschedule'"):
             st.session_state.chat_history.append(("user", prompt))
             with st.chat_message("user"): st.markdown(prompt)
@@ -550,38 +582,47 @@ def main():
             
             if res['intent'] == 'cancel':
                 reply = "⚠️ **Pembatalan Booking**\n\nHubungi Admin kami: 👉 **[WhatsApp Admin](https://wa.me/6281234567890)**"
-                st.session_state.bot_state = {"mode": "idle", "step": 0, "name": None, "date": None, "time": None, "dur": 1, "items": [], "target_id": None}
+                st.session_state.bot_state = {"mode": "idle", "step": 0, "name": None, "phone": None, "date": None, "time": None, "dur": 1, "items": [], "target_id": None}
             
             elif res['intent'] == 'reset':
                 reply = "🔄 Oke, diulang. Silakan ketik **'Booking'** lagi."
-                st.session_state.bot_state = {"mode": "idle", "step": 0, "name": None, "date": None, "time": None, "dur": 1, "items": [], "target_id": None}
+                st.session_state.bot_state = {"mode": "idle", "step": 0, "name": None, "phone": None, "date": None, "time": None, "dur": 1, "items": [], "target_id": None}
             
             else:
-                # --- LOGIKA NORMAL ---
                 if res['date']: bs['date'] = res['date']
-                if res['time']: bs['time'] = res['time']
+                if bs['step'] != 'ASK_PHONE':
+                    if res['time']: bs['time'] = res['time']
                 if res['dur']: bs['dur'] = res['dur']
                 if res['found_items']: bs['items'].extend(res['found_items'])
 
                 reply = ""
                 
-                # 1. STEP: ASK_NAME (Terakhir)
-                if bs['step'] == 'ASK_NAME':
-                    bs['name'] = prompt.title()
-                    if not bs['dur']: bs['dur'] = 1 # Default jaga-jaga
-                    msg, _ = finalize_booking(conn, bs)
-                    reply = msg
-                    st.session_state.bot_state = {"mode": "idle", "step": 0, "name": None, "date": None, "time": None, "dur": None, "items": [], "target_id": None}
+                # 1. STEP: ASK_PHONE (NEW) -> FINALIZE
+                if bs['step'] == 'ASK_PHONE':
+                    # Validasi simpel
+                    if len(prompt) > 8 and any(char.isdigit() for char in prompt):
+                        bs['phone'] = prompt
+                        if not bs['dur']: bs['dur'] = 1 
+                        msg, _ = finalize_booking(conn, bs)
+                        reply = msg
+                        st.session_state.bot_state = {"mode": "idle", "step": 0, "name": None, "phone": None, "date": None, "time": None, "dur": None, "items": [], "target_id": None}
+                    else:
+                        reply = "Nomor HP sepertinya kurang valid. Mohon masukkan nomor yang benar agar Level Member bertambah."
 
-                # 2. STEP: ASK_GEAR
+                # 2. STEP: ASK_NAME -> ASK_PHONE
+                elif bs['step'] == 'ASK_NAME':
+                    bs['name'] = prompt.title()
+                    bs['step'] = 'ASK_PHONE'
+                    reply = f"Halo Kak {bs['name']}. Terakhir, **berapa Nomor WhatsApp kamu?** (Untuk update level member & diskon)."
+
+                # 3. STEP: ASK_GEAR -> ASK_NAME
                 elif bs['step'] == 'ASK_GEAR':
                     if "standar" in prompt.lower() or "tidak" in prompt.lower(): pass 
                     bs['step'] = 'ASK_NAME'
                     reply = f"Oke, alat: {', '.join(bs['items']) if bs['items'] else 'Standar'}. **Atas nama siapa?**"
 
-                # 3. STEP: ASK_DURATION (LOGIKA BARU)
+                # 4. STEP: ASK_DURATION -> ASK_GEAR
                 elif bs['step'] == 'ASK_DURATION':
-                    # Cek angka di input user
                     num_match = re.search(r'\d+', prompt)
                     if num_match:
                         bs['dur'] = int(num_match.group(0))
@@ -590,10 +631,9 @@ def main():
                     else:
                         reply = "Mohon masukkan angka durasi (contoh: '2' atau '2 jam')."
 
-                # 4. STEP: ASK_TIME
+                # 5. STEP: ASK_TIME
                 elif bs['step'] == 'ASK_TIME':
                     if bs['time']:
-                        # CEK DURASI DULU
                         if bs['dur'] is None:
                             bs['step'] = 'ASK_DURATION'
                             reply = "Jam aman. **Mau main berapa jam?**"
@@ -603,7 +643,7 @@ def main():
                     else:
                         reply = "Maaf, jam berapa mulainya? (Contoh: '16' atau 'jam 4 sore')"
 
-                # 5. INTENT: RESCHEDULE
+                # 6. INTENT: RESCHEDULE
                 elif res['intent'] == 'reschedule':
                     bs['mode'] = 'reschedule'
                     bs['step'] = 'RES_NAME'
@@ -625,15 +665,14 @@ def main():
                         if bs['date'] and bs['time']:
                             msg, _ = process_reschedule(conn, bs['target_id'], bs['date'], bs['time'])
                             reply = msg
-                            st.session_state.bot_state = {"mode": "idle", "step": 0, "name": None, "date": None, "time": None, "dur": None, "items": [], "target_id": None}
+                            st.session_state.bot_state = {"mode": "idle", "step": 0, "name": None, "phone": None, "date": None, "time": None, "dur": None, "items": [], "target_id": None}
                         else:
                             reply = "Mohon sebutkan **Hari dan Jam** baru ya. (Contoh: 'Besok jam 14')"
 
-                # 6. INTENT: BOOKING (Start)
+                # 7. INTENT: BOOKING
                 elif res['intent'] == 'booking' or bs['mode'] == 'booking':
                     bs['mode'] = 'booking'
                     if not bs['date']: 
-                        # Fix WIB Timezone
                         wib = datetime.timezone(datetime.timedelta(hours=7))
                         bs['date'] = datetime.datetime.now(wib).strftime("%Y-%m-%d")
                     
@@ -641,21 +680,23 @@ def main():
                         bs['step'] = 'ASK_TIME'
                         reply = f"Siap booking tgl **{bs['date']}**. Jam berapa mainnya?"
                     
-                    # LOGIKA BARU: Jika durasi belum ada, tanya durasi
                     elif bs['dur'] is None:
                         bs['step'] = 'ASK_DURATION'
                         reply = "Jam oke. **Mau sewa berapa jam?**"
 
-                    elif not bs['items'] and bs['step'] != 'ASK_NAME':
+                    elif not bs['items'] and bs['step'] != 'ASK_NAME' and bs['step'] != 'ASK_PHONE':
                         bs['step'] = 'ASK_GEAR'
                         reply = "Sip. **Butuh alat apa saja?**"
                     elif not bs['name']:
                         bs['step'] = 'ASK_NAME'
                         reply = "Siap. **Atas nama siapa**?"
+                    elif not bs['phone']:
+                        bs['step'] = 'ASK_PHONE'
+                        reply = "Terakhir, **Berapa nomor WA kamu?** (Untuk update level member)."
                     else:
                         msg, _ = finalize_booking(conn, bs)
                         reply = msg
-                        st.session_state.bot_state = {"mode": "idle", "step": 0, "name": None, "date": None, "time": None, "dur": None, "items": [], "target_id": None}
+                        st.session_state.bot_state = {"mode": "idle", "step": 0, "name": None, "phone": None, "date": None, "time": None, "dur": None, "items": [], "target_id": None}
                 
                 else:
                     reply = "Halo! Ketik **'Booking'** untuk sewa, **'Reschedule'** untuk ganti jadwal, atau **'Batal'**."
