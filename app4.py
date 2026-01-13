@@ -26,7 +26,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Nama Database
-DB_FILE = 'smartstudio_v16.db'
+DB_FILE = 'smartstudio_v17.db'
 
 # ==========================================
 # 1. DATABASE SYSTEM
@@ -712,3 +712,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
