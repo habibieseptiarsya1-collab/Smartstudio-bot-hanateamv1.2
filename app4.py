@@ -41,7 +41,7 @@ def init_db():
     
     # Tabel Bookings
     c.execute('''CREATE TABLE IF NOT EXISTS bookings (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, Nama Pelanggan TEXT, no_hp TEXT, date TEXT, 
+        id INTEGER PRIMARY KEY AUTOINCREMENT, customer_name TEXT, no_hp TEXT, date TEXT, 
         start_hour INTEGER, duration INTEGER, instruments TEXT, price REAL, status TEXT)''')
     
     c.execute('''CREATE TABLE IF NOT EXISTS inventory (id INTEGER PRIMARY KEY AUTOINCREMENT, item_name TEXT UNIQUE)''')
@@ -613,4 +613,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
